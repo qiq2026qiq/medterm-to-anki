@@ -10,19 +10,34 @@ import json
 from pathlib import Path
 import re
 import time
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
-import xml.etree.ElementTree as ET
 
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Safari/537.36"
 DEFAULT_WORKERS = 8
-DEFAULT_RESULTS = 5
+DEFAULT_RESULTS = 3
+ALGOLIA_APPLICATION_ID = "NLI34IG0X3"
+ALGOLIA_SEARCH_ONLY_API_KEY = "a134144c18c63ca12a4a12bcfb2ad7d7"
+ALGOLIA_INDEX = "Sitecore_Prod"
+ALGOLIA_ENDPOINT = (
+    f"https://{ALGOLIA_APPLICATION_ID}-dsn.algolia.net/1/indexes/{ALGOLIA_INDEX}/query"
+)
 
 
 def is_cleveland_url(value: str) -> bool:
     host = (urlparse(value).hostname or "").lower().rstrip(".")
     return host == "clevelandclinic.org" or host.endswith(".clevelandclinic.org")
+
+
+def is_site_chrome_or_placeholder(value: str) -> bool:
+    lowered = value.casefold()
+    return any(marker in lowered for marker in (
+        "/org/social/cc-fb.jpg",
+        "/org/logo/",
+        "cleveland-clinic-logo",
+        "largefeatureimage/aa41aba3-3189-4d99-9f49-b70fe103eef2",
+    ))
 
 
 def fetch(url: str, timeout: float) -> bytes:
@@ -36,18 +51,27 @@ def clean_text(value: str) -> str:
 
 
 def search_pages(query: str, limit: int, timeout: float) -> list[dict[str, str]]:
-    scoped = query if "site:" in query.casefold() else f"site:clevelandclinic.org {query}"
-    url = "https://www.bing.com/search?format=rss&q=" + quote_plus(scoped)
-    root = ET.fromstring(fetch(url, timeout))
+    """Use the same Algolia index as https://my.clevelandclinic.org/search."""
+    payload = json.dumps({
+        "params": urlencode({"query": query, "hitsPerPage": limit, "getRankingInfo": "true"})
+    }).encode("utf-8")
+    request = Request(ALGOLIA_ENDPOINT, data=payload, headers={
+        "User-Agent": USER_AGENT,
+        "Content-Type": "application/json",
+        "X-Algolia-Application-Id": ALGOLIA_APPLICATION_ID,
+        "X-Algolia-API-Key": ALGOLIA_SEARCH_ONLY_API_KEY,
+    })
+    with urlopen(request, timeout=timeout) as response:
+        result = json.load(response)
     pages: list[dict[str, str]] = []
-    for item in root.findall("./channel/item"):
-        link = (item.findtext("link") or "").strip()
+    for hit in result.get("hits", []):
+        link = urljoin("https://my.clevelandclinic.org", str(hit.get("url") or "").strip())
         if not is_cleveland_url(link):
             continue
         pages.append({
             "page_url": link,
-            "title": clean_text(item.findtext("title") or ""),
-            "snippet": clean_text(item.findtext("description") or ""),
+            "title": clean_text(str(hit.get("title") or hit.get("name") or "")),
+            "snippet": clean_text(str(hit.get("meta description") or "")),
         })
         if len(pages) >= limit:
             break
@@ -76,7 +100,11 @@ class ImageParser(HTMLParser):
 
     def _add(self, source: str, label: str) -> None:
         url = urljoin(self.base_url, source.strip())
-        if is_cleveland_url(url) and not url.lower().endswith(".svg"):
+        if (
+            is_cleveland_url(url)
+            and not url.lower().endswith(".svg")
+            and not is_site_chrome_or_placeholder(url)
+        ):
             self.images.append({"image_url": url, "alt": clean_text(label)})
 
 
@@ -97,6 +125,7 @@ def inspect_page(page: dict[str, str], timeout: float, image_limit: int) -> dict
 
 def process_card(card: dict, limit: int, timeout: float, image_limit: int) -> dict:
     query = str(card.get("image_query") or card["word"]).strip()
+    site_query = str(card.get("semantic_identity") or card["word"]).strip()
     started = time.perf_counter()
     try:
         supplied_pages = card.get("candidate_pages") or []
@@ -106,23 +135,37 @@ def process_card(card: dict, limit: int, timeout: float, image_limit: int) -> di
                 for url in supplied_pages[:limit] if is_cleveland_url(str(url))
             ]
         else:
-            pages = search_pages(query, limit, timeout)
+            pages = search_pages(site_query, limit, timeout)
     except Exception as error:
         return {
-            "word": str(card["word"]), "image_query": query, "status": "search-failed",
+            "word": str(card["word"]), "image_query": query, "site_search_query": site_query,
+            "status": "search-failed",
             "error": f"{type(error).__name__}: {error}", "pages": [],
             "seconds": round(time.perf_counter() - started, 3),
         }
-    inspected = []
-    page_errors = []
-    for page in pages:
-        try:
-            inspected.append(inspect_page(page, timeout, image_limit))
-        except Exception as error:
-            page_errors.append({"page_url": page["page_url"], "error": f"{type(error).__name__}: {error}"})
+    inspected_by_index: dict[int, dict] = {}
+    page_errors_by_index: dict[int, dict] = {}
+    # Site searches are already independent and concurrent. Inspect every returned
+    # page concurrently too, preserving result order without reducing coverage.
+    with ThreadPoolExecutor(max_workers=min(len(pages) or 1, limit)) as page_pool:
+        page_futures = {
+            page_pool.submit(inspect_page, page, timeout, image_limit): (index, page)
+            for index, page in enumerate(pages)
+        }
+        for future in as_completed(page_futures):
+            index, page = page_futures[future]
+            try:
+                inspected_by_index[index] = future.result()
+            except Exception as error:
+                page_errors_by_index[index] = {
+                    "page_url": page["page_url"],
+                    "error": f"{type(error).__name__}: {error}",
+                }
+    inspected = [inspected_by_index[index] for index in sorted(inspected_by_index)]
+    page_errors = [page_errors_by_index[index] for index in sorted(page_errors_by_index)]
     status = "success" if inspected and not page_errors else "incomplete" if inspected or page_errors else "no-results"
     return {
-        "word": str(card["word"]), "image_query": query,
+        "word": str(card["word"]), "image_query": query, "site_search_query": site_query,
         "status": status,
         "pages": inspected, "page_errors": page_errors,
         "seconds": round(time.perf_counter() - started, 3),
@@ -155,7 +198,8 @@ def main() -> None:
 
     final = [item for item in results if item is not None]
     payload = {
-        "source_policy": "candidate pages and images are restricted to clevelandclinic.org",
+        "source_policy": "Cleveland Clinic site-search results and images are restricted to clevelandclinic.org",
+        "search_provider": "https://my.clevelandclinic.org/search (Sitecore_Prod Algolia index)",
         "automatic_no_image_decisions": False,
         "cards": len(final),
         "success": sum(item["status"] == "success" for item in final),
